@@ -1,54 +1,3 @@
-#!/usr/bin/env python3
-"""
-tactical_battlefield_sim.py
-===========================
-Member-1 deliverable: physical battlefield world (SimPy) + Tactical Translation Layer
-that emits the exact 13-feature frame used by the federated baseline notebook.
-
-PIPELINE
---------
-  SimPy world (ambient weather, benign traffic, hostile campaigns)
-        |
-        v   per node, every 2 s window, K=8 sub-samples (4 Hz on-node feature rate)
-  Region sensor models  ->  physical metrics (dB, um/s, nT, degC, dBm, ...)
-        |
-        v   TACTICAL TRANSLATION LAYER  (translate_to_packets)
-  event-driven uplink policy (send-on-delta + alert keep-alives + heartbeat)
-        |
-        v   shared half-duplex radio channel (CSMA/CA, RSSI->SINR->PER, ARQ), all in SimPy
-  node-side packet trace  ->  UNSW-NB15-style flow record
-        |
-        v
-  13 features: dur spkts dpkts sbytes dbytes sload dload sjit djit tcprtt synack ackdat rate
-
-MAPPING TABLE  (physical quantity -> traffic feature; this is the paper's "translation")
--------------------------------------------------------------------------------------
-  how much the world changes   -> spkts / sbytes / rate    (send-on-delta + alert reports)
-  which modalities are active  -> sbytes/spkts             (payload size differs per modality;
-                                                            overhead-sat patch = RLE'd, so bigger
-                                                            when more pixels change)
-  temporal structure of events -> sjit / dur               (gunshot bursts, footstep cadence,
-                                                            hover vs. fly-by change report timing)
-  radio RSSI / noise floor     -> synack / ackdat / tcprtt (SINR -> packet error -> retransmit,
-                                                            CCA back-off under jamming)
-  cluster-wide event storms    -> synack / djit / dpkts    (shared channel + gateway CPU queueing)
-  gateway ACK / alert polling  -> dpkts / dbytes / dload
-
-SENSOR SUITES (as specified in the project brief)
-  Region A  air strip      : overhead EO patch (8x8 flattened) + dB audio + speed laser + thermal array
-  Region B  supply valley  : geophone + magnetometer + PIR
-  Region C  perimeter      : piezo-acoustic fence cable + ambient probes (T/RH/P) + ad-hoc radio RSSI
-
-GROUNDING (what is literature-backed vs. assumed) is documented in PARAMETER_NOTES at the bottom.
-
-Usage in the notebook (drop-in for the UNSW/CICIDS partitions)
---------------------------------------------------------------
-    from tactical_battlefield_sim import build_tactical_partitions, unsw_cols_map
-    partitions, df_eval, raw = build_tactical_partitions(rows_per_client=20000)
-    execute_federated_experiment(partitions, df_eval, model_type="FcNN", strategy="FedAvg")
-
-Requires: pip install simpy numpy pandas
-"""
 from __future__ import annotations
 
 import argparse
@@ -63,31 +12,27 @@ import numpy as np
 import pandas as pd
 import simpy
 
-# =============================================================================
-# 1. CONSTANTS / FEATURE CONTRACT
-# =============================================================================
 FEATURES = ['dur', 'spkts', 'dpkts', 'sbytes', 'dbytes', 'sload', 'dload',
             'sjit', 'djit', 'tcprtt', 'synack', 'ackdat', 'rate']
-unsw_cols_map = FEATURES                      # alias so notebook code is unchanged
+unsw_cols_map = FEATURES                      
 
-WINDOW_S = 2.0                                # one flow record per node per window
-K_SUB = 8                                     # sub-samples per window  (4 Hz feature rate)
+WINDOW_S = 2.0                               
+K_SUB = 8                                     
 DT_SUB = WINDOW_S / K_SUB
-C_SOUND = 343.0
-PERCEPT_DB = 12.0                             # hostile source is labelled 'present' iff it reaches the node's own alert level (12 dB over noise)
-HDR_BYTES = 31                                # 11 B MAC/6LoWPAN + 20 B transport header
+C_SOUND = 343.0  #The physical speed of sound in dry air at roughly 20°C
+PERCEPT_DB = 12.0 #The target detection signal-to-noise gatekeeper floor, set to 12.0 dB, the threshold                           
+HDR_BYTES = 31  #The mandatory packet protocol encapsulation overhead , #11 bytes for MAC layer headers (e.g., 6LoWPAN) and 20 bytes for transport layer headers (e.g., UDP/TCP).
+                           
 MTU_PAYLOAD = 96
-PL0_DB = 31.7                                 # free-space loss @1 m, ~915 MHz
+PL0_DB = 31.7 #The baseline Free-Space Path Loss constant at exactly 1 meter from the antenna                               
 HEARTBEAT_B = 14
 
-# A-priori, globally agreed normalisation (no per-client fitting -> FL-safe).
-# x_norm = log1p(x/ref) / log1p(max/ref), clipped to [0,1].
-FEATURE_SPEC = {   # maxima ~1.4-2x the largest value seen over six clusters (incl. jamming episodes)
+FEATURE_SPEC = {   
     'dur':    (0.05, 5.0),   'spkts':  (1.0, 40.0),    'dpkts': (1.0, 20.0),
     'sbytes': (10.0, 3000.0), 'dbytes': (10.0, 600.0),
     'sload':  (100.0, 1.2e5), 'dload':  (100.0, 6e4),
-    'sjit':   (0.1, 1800.0), 'djit':   (0.1, 1800.0),   # ms
-    'tcprtt': (0.001, 3.0),  'synack': (0.001, 2.5), 'ackdat': (0.001, 1.0),   # s
+    'sjit':   (0.1, 1800.0), 'djit':   (0.1, 1800.0),   
+    'tcprtt': (0.001, 3.0),  'synack': (0.001, 2.5), 'ackdat': (0.001, 1.0),   
     'rate':   (1.0, 600.0),
 }
 
@@ -99,22 +44,18 @@ def normalize_features(raw: pd.DataFrame) -> pd.DataFrame:
         out[f] = np.clip(v, 0.0, 1.0).astype(np.float32)
     return out
 
-
-# =============================================================================
-# 2. EVENTS (anything physical that moves, emits, or radiates)
-# =============================================================================
 @dataclass
 class Event:
     eid: int
     kind: str
-    label: str                      # 'Benign' or an attack class
+    label: str                      
     t0: float
-    wp_t: np.ndarray                # waypoint times (relative to t0)
-    wp_xyz: np.ndarray              # (n,3) metres
-    power: np.ndarray               # (n,) 0..1 engine/activity profile
+    wp_t: np.ndarray                
+    wp_xyz: np.ndarray              
+    power: np.ndarray               
     sig: Dict[str, object] = field(default_factory=dict)
-    impulses: np.ndarray = field(default_factory=lambda: np.zeros(0))      # absolute times
-    impulse_db: np.ndarray = field(default_factory=lambda: np.zeros(0))    # dB@1m (A) or mV@contact (C)
+    impulses: np.ndarray = field(default_factory=lambda: np.zeros(0))      
+    impulse_db: np.ndarray = field(default_factory=lambda: np.zeros(0))    
 
     @property
     def t1(self) -> float:
@@ -132,28 +73,25 @@ class Event:
         return np.interp(np.asarray(t, dtype=float) - self.t0, self.wp_t, self.power, left=0.0, right=0.0)
 
 
-# =============================================================================
-# 3. CONFIG
-# =============================================================================
 @dataclass
 class RadioCfg:
-    bitrate: float = 250e3
-    tx_dbm: float = 14.0
+    bitrate: float = 250e3 #the raw transmission speed in bits per sec
+    tx_dbm: float = 14.0 # 
     noise_floor_dbm: float = -114.0
     n_exp: float = 3.0
-    sigma_db: float = 6.0
-    shadow_rho: float = 0.9
-    cca_dbm: float = -92.0
+    sigma_db: float = 6.0 # the standard deviation of the signal strength deviation to represent the rain , rough landscapes
+    shadow_rho: float = 0.9 # dependency on previous
+    cca_dbm: float = -92.0 # clear channel assessment : more than 92 dbm signal strength detected then marked as busy
     slot_s: float = 0.002
     phy_overhead_bytes: int = 8
-    gw_service_s: float = 0.0015
-    rto_s: float = 0.06
+    gw_service_s: float = 0.0015 # processing delay
+    rto_s: float = 0.06 
 
 
 @dataclass
 class ClusterCfg:
     client: str
-    region: str                                   # 'A' | 'B' | 'C'
+    region: str                                   
     n_nodes: int = 6
     radio: RadioCfg = field(default_factory=RadioCfg)
     gw_pos: Tuple[float, float, float] = (0.0, -100.0, 4.0)
@@ -165,11 +103,11 @@ class ClusterCfg:
     temp_amp: float = 7.0
     amb_db: float = 46.0                          # A: ambient audio level (dB SPL)
     amb_centroid_hz: float = 300.0
-    th_fov_deg: float = 70.0
-    geo_noise_um: float = 3.0                     # B: geophone noise (um/s rms)
-    mag_noise_nt: float = 0.5
-    pz_noise_mv: float = 1.5                      # C: piezo noise (mV rms)
-    benign_rate_h: Dict[str, float] = field(default_factory=dict)
+    th_fov_deg: float = 70.0  # The Field-of-View visual sweep angle for the thermal tracking array, set to a 70-degree cone.
+    geo_noise_um: float = 3.0                     # B: geophone noise um/s , ground motion or vibration velocity
+    mag_noise_nt: float = 0.5                     # in nano tesla , magnetic field noise
+    pz_noise_mv: float = 1.5                      # C: piezo noise (milli volts) the electrical noise in piezo fence sensors
+    benign_rate_h: Dict[str, float] = field(default_factory=dict) # 
     attack_mix: Dict[str, float] = field(default_factory=dict)
     attack_rate_h: float = 20.0                   # attack *campaigns* per hour
 
@@ -203,10 +141,6 @@ class Node:
     sat_bg: Optional[np.ndarray] = None
     sat_prev: Optional[np.ndarray] = None
 
-
-# =============================================================================
-# 4. WORLD
-# =============================================================================
 def build_nodes(cfg: ClusterCfg, rng: np.random.Generator, gw: np.ndarray) -> List[Node]:
     n, nodes = cfg.n_nodes, []
     for i in range(n):
@@ -340,9 +274,6 @@ def ambient_process(env: simpy.Environment, w: World):
         w.press += 0.01 * ((1008.0 - 3.0 * w.rain) - w.press) + 0.02 * rng.normal()
 
 
-# =============================================================================
-# 5. SENSOR MODELS  (physical world -> per-modality series)
-# =============================================================================
 def _absorb(f_hz: float) -> float:
     """Atmospheric absorption, dB/km (order-of-magnitude, 4-15 dB/km over 0.3-1 kHz)."""
     return 3.0 + 0.012 * f_hz
@@ -363,7 +294,7 @@ def _amb_audio_db(w: World) -> float:
     return w.cfg.amb_db + 8.0 * math.log10(1 + (w.wind / 2.5) ** 2) + 14.0 * w.rain
 
 
-GSD_M = 16.0                                       # overhead patch ground-sample distance
+GSD_M = 16.0                                       
 _GX, _GY = np.meshgrid((np.arange(8) - 3.5) * GSD_M, (np.arange(8) - 3.5) * GSD_M)
 _GX, _GY = _GX.ravel(), _GY.ravel()
 
@@ -604,10 +535,6 @@ def label_window(w: World, sense: Sense) -> Tuple[int, str, str]:
     return 0, 'Benign', 'ambient'
 
 
-# =============================================================================
-# 6. TACTICAL TRANSLATION LAYER   (physical metrics  ->  uplink packet plan)
-# =============================================================================
-# modality : (send-on-delta threshold, normal report payload B, alert report payload B)
 MOD_SPEC = {
     'aud': (4.0, 8, 20), 'th': (0.8, 4, 20), 'las': (1.5, 4, 10), 'sat': (0.04, 6, 16),
     'geo': (5.0, 6, 24), 'mag': (2.5, 4, 12), 'pir': (0.5, 2, 4),
@@ -666,9 +593,6 @@ def translate_to_packets(node: Node, sense: Sense, rng: np.random.Generator, wid
     return pkts
 
 
-# =============================================================================
-# 7. RADIO TRANSPORT (SimPy)  ->  packet trace  ->  13 features
-# =============================================================================
 def packet_error_prob(sinr_db: float, nbytes: int) -> float:
     """Non-coherent FSK BER = 0.5 exp(-SNR/2); PER = 1-(1-BER)^bits."""
     ber = 0.5 * math.exp(-0.5 * 10 ** (min(sinr_db, 40.0) / 10))
@@ -814,10 +738,6 @@ def node_process(w: World, node: Node):
         env.process(uplink_session(w, node, pkts, meta))
         widx += 1
 
-
-# =============================================================================
-# 8. EVENT FACTORIES (benign + hostile)       -> each returns an Event starting at time t
-# =============================================================================
 def _mk(w, kind, label, t, wp_t, wp_xyz, power, sig, impulses=None, impulse_db=None) -> Event:
     return Event(eid=w.new_eid(), kind=kind, label=label, t0=t, wp_t=np.asarray(wp_t, float),
                  wp_xyz=np.asarray(wp_xyz, float).reshape(-1, 3), power=np.asarray(power, float), sig=sig,
@@ -1302,10 +1222,6 @@ def calibrate_cluster(cfg: ClusterCfg, shares: Dict[str, float], target_frac: fl
         rate *= target_frac / max(frac, 0.01)
     return wts, rate
 
-
-# =============================================================================
-# 10. CLI
-# =============================================================================
 def main():
     ap = argparse.ArgumentParser(description="Generate the tactical D1..D6 datasets with the SimPy battlefield simulator")
     ap.add_argument('--rows', type=int, default=20000, help='flow records per client')
@@ -1325,7 +1241,6 @@ def main():
     print(f"saved to ./{a.out}/")
 
 
-# -----------------------------------------------------------------------------
 PARAMETER_NOTES = """
 LITERATURE-BACKED
   MMAUD (Yuan et al., arXiv 2402.03706): platform list Mavic2/Mavic3/Avata/Phantom4/M300; audio + lidar + radar
